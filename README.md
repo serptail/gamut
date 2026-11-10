@@ -138,7 +138,7 @@ gamut runs on **Android 8.0 (API 26) and newer**, on phones and tablets.
 
 > **Updates are built in.** gamut checks for new releases itself and downloads them in the background. See [Releases and Updates](#releases-and-updates).
 
-> **Note:** Official release builds target `arm64-v8a`, which covers virtually all modern phones. Build from source if you need another ABI.
+> **Note:** Official release builds target `arm64-v8a` and `armeabi-v7a`, which covers virtually all Android phones, 64-bit and 32-bit. Build from source if you need another ABI.
 
 ## How It Works
 
