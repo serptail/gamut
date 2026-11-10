@@ -111,7 +111,7 @@ jobs:
         if: steps.plan.outputs.changed == 'true'
         run: ./gradlew :app:assembleDebug --no-daemon
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: steps.plan.outputs.changed == 'true'
         with:
           name: bump-toml
@@ -119,7 +119,7 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always() && steps.plan.outputs.changed == 'true'
         with:
           name: smoke-logs
