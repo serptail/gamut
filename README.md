@@ -136,7 +136,7 @@ gamut runs on **Android 8.0 (API 26) and newer**, on phones and tablets.
 2. Open the file on your phone. If Android asks, allow installs from your browser for this one time.
 3. Launch gamut. No account or setup is needed.
 
-> **Updates are built in.** gamut checks for new releases itself and downloads them in the background. See [Releases and Updates](#releases-and-updates).
+> **Updates are built in.** gamut checks for new releases itself and downloads them in the background.
 
 > **Note:** Official release builds target `arm64-v8a` and `armeabi-v7a`, which covers virtually all Android phones, 64-bit and 32-bit. Build from source if you need another ABI.
 
