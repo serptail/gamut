@@ -1,0 +1,365 @@
+name: db-backup
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: db-backup
+  cancel-in-progress: false
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      RETENTION_DAYS: "30"
+
+    steps:
+      - name: Dump database and roles
+        shell: bash
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          [[ -n "${DB_URL:-}" ]] || {
+            echo "::error::SUPABASE_DB_URL is missing"
+            exit 1
+          }
+
+          [[ -n "${BACKUP_PASSPHRASE:-}" ]] || {
+            echo "::error::BACKUP_PASSPHRASE is missing"
+            exit 1
+          }
+
+          command -v docker >/dev/null
+          command -v gpg >/dev/null
+
+          dir="${RUNNER_TEMP}/db-backup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$dir"
+
+          timestamp="$(date -u +'%Y%m%dT%H%M%SZ')"
+          suffix="${timestamp}-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
+
+          {
+            printf 'BACKUP_DIR=%s\n' "$dir"
+            printf 'BACKUP_SUFFIX=%s\n' "$suffix"
+          } >> "$GITHUB_ENV"
+
+          echo "Creating PostgreSQL custom-format dump..."
+
+          docker run --rm \
+            --env DB_URL \
+            postgres:17 \
+            sh -ceu 'pg_dump "$DB_URL" --format=custom --no-owner' \
+            > "$dir/db.dump"
+
+          test -s "$dir/db.dump"
+
+          # Check the archive can be read by pg_restore.
+          docker run --rm \
+            --volume "$dir:/backup:ro" \
+            postgres:17 \
+            pg_restore --list /backup/db.dump \
+            > /dev/null
+
+          echo "Dumping global roles (no passwords)..."
+
+          # pg_dump does not include roles. Supabase does not allow reading
+          # role passwords, so they are excluded. Non-fatal: warn on failure.
+          if docker run --rm \
+              --env DB_URL \
+              postgres:17 \
+              sh -ceu 'pg_dumpall --dbname="$DB_URL" --roles-only --no-role-passwords' \
+              > "$dir/roles.sql" && [[ -s "$dir/roles.sql" ]]; then
+            echo "Roles dump created."
+          else
+            echo "::warning::Roles dump failed; continuing without it"
+            rm -f "$dir/roles.sql"
+          fi
+
+      - name: Configure S3 client
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          command -v aws >/dev/null || {
+            echo "::error::AWS CLI is required on the runner"
+            exit 1
+          }
+
+          mkdir -p "$HOME/.aws"
+
+          cat > "$HOME/.aws/config" <<EOF
+          [default]
+          s3 =
+              addressing_style = path
+              preferred_transfer_client = classic
+          EOF
+
+          chmod 600 "$HOME/.aws/config"
+
+          aws --version
+
+      - name: Download Supabase Storage files
+        shell: bash
+        env:
+          S3_ENDPOINT: ${{ secrets.SUPABASE_S3_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.SUPABASE_S3_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_S3_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.SUPABASE_S3_REGION }}
+          AWS_RETRY_MODE: standard
+          AWS_MAX_ATTEMPTS: "5"
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          set -euo pipefail
+          umask 077
+
+          if [[ -z "${S3_ENDPOINT:-}" ]]; then
+            echo "::notice::SUPABASE_S3_ENDPOINT not set; skipping Storage file backup"
+            exit 0
+          fi
+
+          S3_ENDPOINT="${S3_ENDPOINT%/}"
+          out="$BACKUP_DIR/storage"
+          mkdir -p "$out"
+
+          buckets="$(
+            aws --endpoint-url "$S3_ENDPOINT" \
+              s3api list-buckets \
+              --query 'Buckets[].Name' \
+              --output text
+          )"
+
+          count=0
+          failed=0
+          for bucket in $buckets; do
+            echo "Syncing bucket: $bucket"
+            mkdir -p "$out/$bucket"
+
+            # s3 sync is incremental, so a retry only fetches what is missing.
+            ok=0
+            for attempt in 1 2 3; do
+              if aws --endpoint-url "$S3_ENDPOINT" \
+                  s3 sync "s3://$bucket" "$out/$bucket" \
+                  --only-show-errors; then
+                ok=1
+                break
+              fi
+              echo "::warning::Sync of bucket $bucket failed (attempt $attempt/3)"
+              sleep 10
+            done
+
+            if [[ $ok -eq 1 ]]; then
+              count=$((count + 1))
+            else
+              echo "::warning::Bucket $bucket synced with errors; some files were not downloaded"
+              failed=$((failed + 1))
+            fi
+          done
+
+          echo "Downloaded $count bucket(s), $failed with errors."
+
+          # The database dump is the critical part and already exists, so a few
+          # bad files only warn. Fail only if no bucket could be synced at all.
+          if [[ $failed -gt 0 && $count -eq 0 ]]; then
+            echo "::error::All Storage buckets failed to sync"
+            exit 1
+          fi
+
+      - name: Encrypt and validate backups
+        shell: bash
+        env:
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          encrypt() {
+            local src="$1" dest="$2"
+
+            printf '%s' "$BACKUP_PASSPHRASE" |
+              gpg --batch --yes \
+                --pinentry-mode loopback \
+                --passphrase-fd 0 \
+                --symmetric \
+                --cipher-algo AES256 \
+                --output "$dest" \
+                "$src"
+
+            test -s "$dest"
+          }
+
+          verify() {
+            # Decrypt to stdout so callers can pipe into further checks.
+            printf '%s' "$BACKUP_PASSPHRASE" |
+              gpg --batch --quiet \
+                --pinentry-mode loopback \
+                --passphrase-fd 0 \
+                --decrypt \
+                "$1"
+          }
+
+          echo "Encrypting with GPG AES-256..."
+
+          # Database dump
+          encrypt "$BACKUP_DIR/db.dump" \
+            "$BACKUP_DIR/db-${BACKUP_SUFFIX}.dump.gpg"
+          verify "$BACKUP_DIR/db-${BACKUP_SUFFIX}.dump.gpg" > /dev/null
+          rm -f "$BACKUP_DIR/db.dump"
+
+          # Roles
+          if [[ -s "$BACKUP_DIR/roles.sql" ]]; then
+            encrypt "$BACKUP_DIR/roles.sql" \
+              "$BACKUP_DIR/roles-${BACKUP_SUFFIX}.sql.gpg"
+            verify "$BACKUP_DIR/roles-${BACKUP_SUFFIX}.sql.gpg" > /dev/null
+            rm -f "$BACKUP_DIR/roles.sql"
+          fi
+
+          # Storage files
+          if [[ -d "$BACKUP_DIR/storage" ]] &&
+             [[ -n "$(ls -A "$BACKUP_DIR/storage")" ]]; then
+            tar -C "$BACKUP_DIR/storage" -czf "$BACKUP_DIR/storage.tar.gz" .
+            encrypt "$BACKUP_DIR/storage.tar.gz" \
+              "$BACKUP_DIR/storage-${BACKUP_SUFFIX}.tar.gz.gpg"
+            verify "$BACKUP_DIR/storage-${BACKUP_SUFFIX}.tar.gz.gpg" |
+              tar -tz > /dev/null
+            rm -rf "$BACKUP_DIR/storage" "$BACKUP_DIR/storage.tar.gz"
+          fi
+
+          # Nothing unencrypted may remain.
+          if find "$BACKUP_DIR" -type f ! -name '*.gpg' | grep -q .; then
+            echo "::error::Unencrypted files remain in backup directory"
+            exit 1
+          fi
+
+          for f in "$BACKUP_DIR"/*.gpg; do
+            sha256sum "$f" | awk '{ print "SHA-256: " $1 "  " $2 }'
+          done
+
+          echo "Encrypted backups created successfully."
+
+      - name: Check backup repo access
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_REPO_TOKEN }}
+          BACKUP_REPO: ${{ vars.BACKUP_REPO }}
+        run: |
+          set -euo pipefail
+
+          for name in GH_TOKEN BACKUP_REPO; do
+            [[ -n "${!name:-}" ]] || {
+              echo "::error::Backup destination is not configured: $name (secret BACKUP_REPO_TOKEN, variable BACKUP_REPO)"
+              exit 1
+            }
+          done
+
+          # GitHub answers 404 (not 403) when a token has no access to a private repo.
+          info="$(gh api "repos/$BACKUP_REPO" --jq '{full_name, private, push: .permissions.push}')" || {
+            echo "::error::Token cannot see $BACKUP_REPO. Check the repo name and that BACKUP_REPO_TOKEN is granted this repo (fine-grained: Contents = Read and write; classic: repo scope)."
+            exit 1
+          }
+          echo "$info"
+
+          [[ "$(jq -r '.push' <<< "$info")" == "true" ]] || {
+            echo "::error::Token can see $BACKUP_REPO but has no write access. Grant Contents: Read and write."
+            exit 1
+          }
+
+      - name: Upload to the private backup repo and verify
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_REPO_TOKEN }}
+          BACKUP_REPO: ${{ vars.BACKUP_REPO }}
+        run: |
+          set -euo pipefail
+
+          for name in GH_TOKEN BACKUP_REPO; do
+            [[ -n "${!name:-}" ]] || {
+              echo "::error::Backup destination is not configured: $name (secret BACKUP_REPO_TOKEN, variable BACKUP_REPO)"
+              exit 1
+            }
+          done
+
+          shopt -s nullglob
+          files=("$BACKUP_DIR"/*.gpg)
+
+          [[ ${#files[@]} -gt 0 ]] || {
+            echo "::error::No encrypted backup files found"
+            exit 1
+          }
+
+          tag="backup-${BACKUP_SUFFIX}"
+
+          echo "Creating release $tag in $BACKUP_REPO ..."
+          gh release create "$tag" "${files[@]}" \
+            --repo "$BACKUP_REPO" \
+            --title "Backup ${BACKUP_SUFFIX}" \
+            --notes "Encrypted database backup. Decrypt with the BACKUP_PASSPHRASE."
+
+          # Ask GitHub what it really stored and compare the sizes.
+          release_json="$(gh api "repos/$BACKUP_REPO/releases/tags/$tag")"
+
+          for local_file in "${files[@]}"; do
+            name="$(basename "$local_file")"
+            remote_size="$(jq -r --arg n "$name" \
+              '.assets[] | select(.name == $n and .state == "uploaded") | .size' <<< "$release_json")"
+            local_size="$(stat -c '%s' "$local_file")"
+
+            if [[ ! "$remote_size" =~ ^[0-9]+$ ]] ||
+               [[ "$remote_size" -ne "$local_size" ]]; then
+              echo "::error::Size verification failed for $name (remote: ${remote_size:-missing}, local: $local_size)"
+              exit 1
+            fi
+
+            echo "::notice::Uploaded and verified: $name ($remote_size bytes)"
+          done
+
+      - name: Remove expired backups
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_REPO_TOKEN }}
+          BACKUP_REPO: ${{ vars.BACKUP_REPO }}
+        run: |
+          set -euo pipefail
+
+          cutoff="$(date -u -d "${RETENTION_DAYS} days ago" +'%Y%m%dT%H%M%SZ')"
+
+          # Runs only after the new backup was uploaded and verified.
+          deleted=0
+
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+
+            # Only delete releases created by this workflow.
+            if [[ "$tag" =~ ^backup-([0-9]{8}T[0-9]{6}Z)-run-[0-9]+-attempt-[0-9]+$ ]]; then
+              backup_time="${BASH_REMATCH[1]}"
+
+              if [[ "$backup_time" < "$cutoff" ]]; then
+                gh release delete "$tag" --repo "$BACKUP_REPO" --cleanup-tag --yes
+                echo "Deleted expired backup: $tag"
+                deleted=$((deleted + 1))
+              fi
+            fi
+          done < <(gh api --paginate "repos/$BACKUP_REPO/releases?per_page=100" --jq '.[].tag_name')
+
+          echo "Retention cleanup finished: removed $deleted expired release(s)."
+
+      - name: Clean up local temporary files
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${BACKUP_DIR:-}" &&
+                "$BACKUP_DIR" == "$RUNNER_TEMP"/db-backup-* ]]; then
+            rm -rf -- "$BACKUP_DIR"
+          fi

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="gamut_blue">#3752DB</color>
+    <color name="gamut_violet">#7048D8</color>
+    <color name="gamut_magenta">#B8329E</color>
+    <color name="gamut_ink">#0F0F10</color>
+    <color name="gamut_night">#1A1A1C</color>
+    <color name="gamut_mist">#F4F4F5</color>
+    <color name="gamut_white">#FFFFFF</color>
+    <color name="gamut_black">#000000</color>
+    <color name="gamut_glow_blue">#2E4DC9</color>
+    <color name="gamut_glow_violet">#4C30AC</color>
+    <color name="gamut_glow_magenta">#782076</color>
+    <color name="gamut_sky">#99B1FF</color>
+    <color name="gamut_lilac">#AD96EE</color>
+    <color name="gamut_rose">#D89BCD</color>
+</resources>

@@ -1,0 +1,198 @@
+name: extractor-bump
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: extractor-bump
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      changed: ${{ steps.plan.outputs.changed }}
+      summary: ${{ steps.plan.outputs.summary }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Ignore file-mode changes
+        run: git config core.fileMode false
+
+      - name: Skip while a bump is waiting for review
+        id: pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n=$(gh pr list --repo "$GITHUB_REPOSITORY" --head extractor-bump --state open --json number --jq length)
+          if [ "$n" -gt 0 ]; then
+            echo "::notice::An extractor bump pull request is already open; skipping this run."
+            echo "waiting=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "waiting=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Look for newer versions
+        id: plan
+        if: steps.pending.outputs.waiting != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/bump_extractors.py plan
+
+      - uses: actions/setup-java@v4
+        if: steps.plan.outputs.changed == 'true'
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.plan.outputs.changed == 'true'
+
+      - name: Wait until the new versions can be downloaded
+        if: steps.plan.outputs.changed == 'true'
+        run: python3 scripts/bump_extractors.py wait
+
+      - name: Smoke test, current versions
+        if: steps.plan.outputs.changed == 'true'
+        run: |
+          chmod +x gradlew
+          ./gradlew :tools:extractor-smoke:run --console=plain -q 2>&1 | tee smoke-before.txt || true
+
+      - name: Apply the bump
+        if: steps.plan.outputs.changed == 'true'
+        run: python3 scripts/bump_extractors.py apply
+
+      - name: Smoke test, new versions
+        if: steps.plan.outputs.changed == 'true'
+        run: |
+          # No "|| true": with pipefail, a compile failure now really stops here (library API changed, a person must look).
+          ./gradlew :tools:extractor-smoke:run --console=plain -q 2>&1 | tee smoke-after.txt
+
+          BLOCK='not a bot|SignInConfirmNotBot|LOGIN_REQUIRED'
+          # Failures caused by YouTube blocking the runner (inconclusive).
+          blocked() { grep '^fail ' "$1" | grep -Eic "$BLOCK" || true; }
+          # Failures NOT caused by blocking (real problems with the library).
+          real() { grep '^fail ' "$1" | grep -Eivc "$BLOCK" || true; }
+          passed() { grep -o 'SMOKE_RESULT passed=[0-9]*' "$1" | tail -n 1 | grep -o '[0-9]*$' || echo 0; }
+
+          bb=$(blocked smoke-before.txt); ba=$(blocked smoke-after.txt)
+          rb=$(real smoke-before.txt);    ra=$(real smoke-after.txt)
+          pb=$(passed smoke-before.txt);  pa=$(passed smoke-after.txt)
+          echo "passed:  before=$pb after=$pa"
+          echo "blocked: before=$bb after=$ba (inconclusive, ignored)"
+          echo "real failures: before=$rb after=$ra"
+
+          if [ "$ra" -gt "$rb" ]; then
+            echo "::error::Smoke test regression: $ra failure(s) with the new versions vs $rb with the current versions. Bump aborted."
+            exit 1
+          fi
+          if [ "$pa" -eq 0 ]; then
+            echo "::warning::No tracks resolved with the new versions; the runner was likely blocked by YouTube. Smoke test result is inconclusive."
+          fi
+          if [ "$ba" -gt 0 ] || [ "$bb" -gt 0 ]; then
+            echo "::warning::YouTube blocked the runner for some tracks (before=$bb, after=$ba); these are excluded from the comparison."
+          fi
+
+      - name: The app still builds
+        if: steps.plan.outputs.changed == 'true'
+        run: ./gradlew :app:assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        if: steps.plan.outputs.changed == 'true'
+        with:
+          name: bump-toml
+          path: gradle/libs.versions.toml
+          if-no-files-found: error
+          retention-days: 3
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.plan.outputs.changed == 'true'
+        with:
+          name: smoke-logs
+          path: smoke-*.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  propose:
+    needs: test
+    if: needs.test.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ secrets.BUMP_TOKEN || github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.BUMP_TOKEN || github.token }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bump-toml
+          path: gradle
+
+      - name: Push the bump branch, open the PR, start the draft release
+        env:
+          SUMMARY: ${{ needs.test.outputs.summary }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C extractor-bump
+          git add gradle/libs.versions.toml
+          git status --short
+          git commit -m "chore(deps): $SUMMARY"
+          git push --force origin extractor-bump   # safe: no open PR uses this branch (checked above)
+
+          # Needs Settings > Actions > General > "Allow GitHub Actions to create and approve pull requests".
+          gh pr create --base "$GITHUB_REF_NAME" --head extractor-bump \
+            --title "chore(deps): $SUMMARY" \
+            --body "$(printf 'Automated update of extractor dependencies.\n\n**Changes:** %s\n\nA draft release is built from this branch by the release workflow. This pull request is merged once that release has been published, and closed if the update is rejected.' "$SUMMARY")" \
+            || echo "::warning::Pull request creation failed; verify that GitHub Actions is allowed to create pull requests. The branch extractor-bump was pushed."
+
+          # Retry: the branch is already pushed, so a failed dispatch must not be silently lost.
+          for attempt in 1 2 3; do
+            if gh workflow run release.yml --ref extractor-bump -f force_min=true -f draft=true -f "notes=Updated: $SUMMARY"; then
+              exit 0
+            fi
+            echo "Dispatch attempt $attempt of 3 failed"; sleep $((attempt * 10))
+          done
+          echo "::error::Failed to dispatch release.yml for branch extractor-bump after 3 attempts."
+          exit 1
+
+  notify-failure:
+    needs: [test, propose]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open (or update) an issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Extractor bump failed"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          body="The scheduled extractor bump failed and no release was produced. Run: $RUN_URL"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
