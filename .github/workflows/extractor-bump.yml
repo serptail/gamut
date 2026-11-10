@@ -53,7 +53,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/bump_extractors.py plan
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         if: steps.plan.outputs.changed == 'true'
         with:
           distribution: temurin
