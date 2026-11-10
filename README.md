@@ -62,8 +62,6 @@ Stream any song, build your library, take it offline.
 - [Tech Stack](#tech-stack)
 - [Project Structure](#project-structure)
 - [Building from Source](#building-from-source)
-- [Backend (Supabase)](#backend-supabase)
-- [Releases and Updates](#releases-and-updates)
 - [Permissions and Privacy](#permissions-and-privacy)
 - [Troubleshooting](#troubleshooting)
 - [FAQ](#faq)
